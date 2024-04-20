@@ -1,7 +1,9 @@
 package migrate
 
 import (
+	"bytes"
 	"database/sql"
+	"embed"
 	"fmt"
 	"github.com/logrusorgru/aurora/v3"
 	"io"
@@ -32,9 +34,9 @@ type Migration struct {
 
 // MigrationModel MigrationModel
 type MigrationModel struct {
-	ID        uint64 `json:"id"`
-	Migration string `json:"migration"`
-	CreatedAt string `json:"created_at"`
+	ID        uint64    `json:"id"`
+	Migration string    `json:"migration"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // MigrationOutput 列表输出
@@ -45,9 +47,10 @@ type MigrationOutput struct {
 
 // Config 配置
 type Config struct {
-	Dir       string
-	TableName string
-	DB        *sql.DB
+	Dir       string    // migrate迁移文件的路径，相对路径<相对main入口|编译后二进制文件>
+	Fs        *embed.FS // `Dir`参数指向的路径里的embed机制形成的fs.FS变量，以实现build编译嵌入embed迁移文件
+	TableName string    // 记录migrate迁移历史的数据库表名
+	DB        *sql.DB   // 数据库驱动句柄，用于操纵数据库
 }
 
 // Migrate Migrate对象
@@ -57,7 +60,8 @@ type Migrate struct {
 
 // New 实例化migrate迁移对象
 func New(conf Config) *Migrate {
-	if conf.Dir == "" || conf.TableName == "" || conf.DB == nil {
+	// Dir 和 Fs不得同时都为空，建议是两者都传，方便go build嵌入迁移文件
+	if conf.TableName == "" || conf.DB == nil || (conf.Dir == "" && conf.Fs == nil) {
 		panic("NewMigrate初始化参数错误")
 	}
 
@@ -106,7 +110,7 @@ func (m Migrate) Status() (err error) {
 		}
 		filename := migrations[i].Id
 		if record, ok := executedRecordsMap[filename]; ok {
-			item.Status = record.CreatedAt
+			item.Status = record.CreatedAt.Format("2006-01-02 15:04:05")
 		}
 		output = append(output, item)
 	}
@@ -114,7 +118,7 @@ func (m Migrate) Status() (err error) {
 	return
 }
 
-// Create 创建迁移文件
+// Create 创建迁移文件--仅开发阶段可用
 func (m Migrate) Create(filename string) (err error) {
 	if filename == "" {
 		fmt.Println(aurora.Bold(aurora.Red("migration error:")), "请输入要创建的迁移文件名称")
@@ -145,7 +149,7 @@ func (m Migrate) Create(filename string) (err error) {
 	return
 }
 
-// GetExecutedMigrations 获取已执行的迁移记录
+// GetExecutedMigrations 从Db获取已执行的迁移记录
 func (m Migrate) GetExecutedMigrations() (migrations []MigrationModel, err error) {
 	migrations = make([]MigrationModel, 0)
 	query := "select id,migration,created_at from %s order by id asc"
@@ -295,17 +299,35 @@ func (m Migrate) execute(filename string, action uint8, queries []string) (err e
 	return tx.Commit()
 }
 
-// FindMigrations 读取全部迁移文件
+// FindMigrations 从本地文件系统|fs.FS读取全部迁移文件
 func (m Migrate) FindMigrations() ([]*Migration, error) {
-	filesystem := http.Dir(m.config.Dir)
-	return findMigrations(filesystem)
-}
-
-// findMigrations 读取全部迁移文件
-func findMigrations(dir http.FileSystem) ([]*Migration, error) {
 	migrations := make([]*Migration, 0)
 
-	file, err := dir.Open("/")
+	// ① 优先从 fs.FS 文件系统获取迁移文件内容
+	if m.config.Fs != nil {
+		dirEntry, err := m.config.Fs.ReadDir(".")
+		if err != nil {
+			return nil, err
+		}
+		for _, one := range dirEntry {
+			if !one.IsDir() && strings.HasSuffix(one.Name(), ".sql") {
+				if content, err := m.config.Fs.ReadFile(one.Name()); err == nil {
+					if migration, err := parseMigration(one.Name(), bytes.NewReader(content)); err == nil {
+						migrations = append(migrations, migration)
+					}
+				}
+			}
+		}
+
+		// 排序
+		sort.Sort(byId(migrations))
+
+		return migrations, nil
+	}
+
+	// ② 降级从本地文件系统获取迁移文件内容
+	filesystem := http.Dir(m.config.Dir)
+	file, err := filesystem.Open("/")
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +339,7 @@ func findMigrations(dir http.FileSystem) ([]*Migration, error) {
 
 	for _, info := range files {
 		if strings.HasSuffix(info.Name(), ".sql") {
-			migration, err := migrationFromFile(dir, info)
+			migration, err := migrationFromFile(filesystem, info)
 			if err != nil {
 				return nil, err
 			}
@@ -332,18 +354,18 @@ func findMigrations(dir http.FileSystem) ([]*Migration, error) {
 	return migrations, nil
 }
 
-// migrationFromFile 获取迁移文件内容
+// migrationFromFile 从本地文件系统获取迁移文件内容
 func migrationFromFile(dir http.FileSystem, info os.FileInfo) (*Migration, error) {
 	path := fmt.Sprintf("/%s", strings.TrimPrefix(info.Name(), "/"))
 	file, err := dir.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("Error while opening %s: %s", info.Name(), err)
+		return nil, fmt.Errorf("error while opening %s: %s", info.Name(), err)
 	}
 	defer func() { _ = file.Close() }()
 
 	migration, err := parseMigration(info.Name(), file)
 	if err != nil {
-		return nil, fmt.Errorf("Error while parsing %s: %s", info.Name(), err)
+		return nil, fmt.Errorf("error while parsing %s: %s", info.Name(), err)
 	}
 	return migration, nil
 }
@@ -356,7 +378,7 @@ func parseMigration(id string, r io.ReadSeeker) (*Migration, error) {
 
 	parsed, err := ParseMigration(r)
 	if err != nil {
-		return nil, fmt.Errorf("Error parsing migration (%s): %s", id, err)
+		return nil, fmt.Errorf("error parsing migration (%s): %s", id, err)
 	}
 
 	m.Up = parsed.UpStatements
@@ -368,7 +390,7 @@ func parseMigration(id string, r io.ReadSeeker) (*Migration, error) {
 	return m, nil
 }
 
-// byId byId
+// byId
 type byId []*Migration
 
 func (b byId) Len() int           { return len(b) }
@@ -377,7 +399,7 @@ func (b byId) Less(i, j int) bool { return b[i].Less(b[j]) }
 
 var numberPrefixRegex = regexp.MustCompile(`^(\d+).*$`)
 
-// Less Less
+// Less less
 func (m Migration) Less(other *Migration) bool {
 	switch {
 	case m.isNumeric() && other.isNumeric() && m.VersionInt() != other.VersionInt():
@@ -396,7 +418,7 @@ func (m Migration) isNumeric() bool {
 	return len(m.NumberPrefixMatches()) > 0
 }
 
-// NumberPrefixMatches NumberPrefixMatches
+// NumberPrefixMatches 匹配数字版本号
 func (m Migration) NumberPrefixMatches() []string {
 	return numberPrefixRegex.FindStringSubmatch(m.Id)
 }
